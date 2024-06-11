@@ -164,9 +164,10 @@ class ImageDataset(torch.utils.data.Dataset):
         "interpolation": "cv2_area",  # pil_linear is more accurate but slower
     }
 
-    def __init__(self, root, conf, paths=None):
+    def __init__(self, root, conf, paths=None, mask_dir: Optional[Path] = None):
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
         self.root = root
+        self.mask_dir = mask_dir
 
         if paths is None:
             paths = []
@@ -195,6 +196,7 @@ class ImageDataset(torch.utils.data.Dataset):
         image = image.astype(np.float32)
         size = image.shape[:2][::-1]
 
+
         if self.conf.resize_max and (
             self.conf.resize_force or max(size) > self.conf.resize_max
         ):
@@ -212,6 +214,17 @@ class ImageDataset(torch.utils.data.Dataset):
             "image": image,
             "original_size": np.array(size),
         }
+
+        if self.mask_dir is not None:
+            mask_path = self.mask_dir / f"{name}.png"
+            if mask_path.exists():
+                mask = read_image(mask_path, True)
+                mask = mask.astype(np.float32) / 255.0
+                if self.conf.resize_max and (
+                    self.conf.resize_force or max(size) > self.conf.resize_max
+                ):
+                    mask = resize_image(mask, size_new, 'nearest')
+                data["mask"] = mask
         return data
 
     def __len__(self):
@@ -227,12 +240,13 @@ def main(
     image_list: Optional[Union[Path, List[str]]] = None,
     feature_path: Optional[Path] = None,
     overwrite: bool = False,
+    mask_dir: Optional[Path] = None
 ) -> Path:
     logger.info(
         "Extracting local features with configuration:" f"\n{pprint.pformat(conf)}"
     )
 
-    dataset = ImageDataset(image_dir, conf["preprocessing"], image_list)
+    dataset = ImageDataset(image_dir, conf["preprocessing"], image_list, mask_dir=mask_dir)
     if feature_path is None:
         feature_path = Path(export_dir, conf["output"] + ".h5")
     feature_path.parent.mkdir(exist_ok=True, parents=True)
@@ -265,6 +279,13 @@ def main(
                 pred["scales"] *= scales.mean()
             # add keypoint uncertainties scaled to the original resolution
             uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
+
+            if 'mask' in data:
+                mask = data['mask'][0]
+                valid_keypoint = mask[pred['keypoints'][:, 1].astype('int'), pred['keypoints'][:, 0].astype('int')]
+                pred['keypoints'] = pred['keypoints'][valid_keypoint > 0]
+                pred['descriptors'] = pred['descriptors'][:, valid_keypoint > 0]
+                pred['scores'] = pred['scores'][valid_keypoint > 0]
 
         if as_half:
             for k in pred:
